@@ -3,9 +3,10 @@ package session
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,17 +39,16 @@ type Session struct {
 	afkTimer      *infra.AFKTimer
 	border        *area.Area2D
 
-	// limiter throttles inbound packets from the client to bound memory
-	// growth from packet floods. burstViolations counts consecutive
-	// rate-limit hits; once it crosses a threshold the session is
-	// disconnected, since a sustained flood indicates a malicious or
-	// broken client rather than a momentary burst.
-	limiter        *rate.Limiter
-	burstViolations atomic.Int32
-
 	close chan struct{}
 
 	afk afkState
+
+	corrective correctiveState
+	traffic    trafficState
+
+	// lastForwardedPing is the last client latency (ms) sent to BDS via
+	// ForwardPing. -1 means nothing has been forwarded yet.
+	lastForwardedPing int64
 
 	data *Data
 	log  *slog.Logger
@@ -70,6 +70,24 @@ type afkState struct {
 	warnedApproaching bool
 	markedAFK         bool
 	warnedFinal       bool
+}
+
+type correctiveState struct {
+	mu   sync.Mutex
+	last map[correctiveKey]time.Time
+}
+
+type correctiveKey struct {
+	dimension int32
+	x, z      int32
+}
+
+type malformedPacketError struct {
+	reason string
+}
+
+func (e malformedPacketError) Error() string {
+	return "malformed packet: " + e.reason
 }
 
 // AFKTimer returns the session's AFK configuration, or nil if disabled.
@@ -100,6 +118,44 @@ func (s *Session) TouchMovement(pos mgl32.Vec3, yaw, pitch float32) bool {
 	s.afk.markedAFK = false
 	s.afk.warnedFinal = false
 	return true
+}
+
+// Position returns the latest sampled player position.
+func (s *Session) Position() mgl32.Vec3 {
+	s.afk.mu.RLock()
+	defer s.afk.mu.RUnlock()
+	return s.afk.lastPosition
+}
+
+func (s *Session) allowCorrective(chunkPos protocol.ChunkPos, interval time.Duration) bool {
+	key := correctiveKey{
+		dimension: s.Data().Dimension(),
+		x:         chunkPos.X(),
+		z:         chunkPos.Z(),
+	}
+	now := time.Now()
+	s.corrective.mu.Lock()
+	defer s.corrective.mu.Unlock()
+	if now.Sub(s.corrective.last[key]) < interval {
+		return false
+	}
+	s.corrective.last[key] = now
+	return true
+}
+
+func (s *Session) claimMessage(position mgl32.Vec3, message string) {
+	chunkPos := protocol.ChunkPos{
+		int32(math.Floor(float64(position.X()))) >> 4,
+		int32(math.Floor(float64(position.Z()))) >> 4,
+	}
+	if s.allowCorrective(chunkPos, time.Second) {
+		s.Message(message)
+		if s.claimFactory != nil {
+			s.claimFactory.Metrics().Correction(true)
+		}
+	} else if s.claimFactory != nil {
+		s.claimFactory.Metrics().Correction(false)
+	}
 }
 
 // AFKDuration returns how long the session has been idle. Before the first
@@ -160,41 +216,32 @@ func (s *Session) SetWarnedFinal(v bool) {
 	s.afk.mu.Unlock()
 }
 
-// SendPingIndicator ...
-func (s *Session) SendPingIndicator() {
-	if s.pingIndicator == nil {
-		return
-	}
-
-	ping := s.Ping()
-	var color string
-	switch {
-	case ping < 20:
-		color = "§a"
-	case ping < 50:
-		color = "§e"
-	case ping < 100:
-		color = "§6"
-	case ping < 200:
-		color = "§c"
-	default:
-		color = "§4"
-	}
-
-	s.WriteToClient(&packet.SetTitle{
-		ActionType: packet.TitleActionSetTitle,
-		Text:       fmt.Sprintf("%sCurrent Ping: %s%d", s.pingIndicator.Identifier, color, ping),
-	})
-}
-
 // Data ...
 func (s *Session) Data() *Data {
 	return s.data
 }
 
-// Ping ...
+// Ping returns the client's RakNet latency in milliseconds (half RTT).
 func (s *Session) Ping() int64 {
 	return s.client.Latency().Milliseconds()
+}
+
+// ForwardPing sends the real client↔proxy latency to BDS when it changes.
+// BDS getPing() only sees proxy↔BDS (~0 on same box), so the behavior pack
+// must receive this via chat and drive the PHUD indicator itself.
+func (s *Session) ForwardPing() {
+	ping := s.Ping()
+	if ping == s.lastForwardedPing {
+		return
+	}
+	s.lastForwardedPing = ping
+	s.WriteToServer(&packet.Text{
+		TextType:         packet.TextTypeChat,
+		NeedsTranslation: false,
+		SourceName:       s.ClientData().ThirdPartyName,
+		Message:          fmt.Sprintf("[PROXY_PING] %d", ping),
+		XUID:             s.IdentityData().XUID,
+	})
 }
 
 // WriteToClient ...
@@ -338,47 +385,33 @@ func (s *Session) Server() session.Conn {
 
 // handlePacket passes packet into corresponding handler.
 func (s *Session) handlePacket(p packet.Packet, conn Conn) (bool, error) {
-	// Rate-limit packets coming from the real client only. The backend
-	// server connection is trusted and must never be throttled, since
-	// dropping or delaying server packets would desync the client.
-	if conn == s.client && s.limiter != nil {
-		if !s.limiter.Allow() {
-			violations := s.burstViolations.Add(1)
-			if violations == 1 {
-				s.log.Warn("client exceeding packet rate limit, dropping packets", "id", p.ID())
-			}
-			// Sustained flooding (not just a brief burst) means the
-			// client is misbehaving — disconnect instead of letting it
-			// keep piling up work indefinitely.
-			if violations > 200 {
-				s.log.Error("disconnecting client for sustained packet flood", "id", p.ID())
-				s.Disconnect("You have been disconnected for sending packets too quickly.")
-				return false, fmt.Errorf("client exceeded packet rate limit")
-			}
-			return false, nil
-		}
-		s.burstViolations.Store(0)
-	}
-
-	// Block packets ID 1 and 135 with specific payload from client
-	if conn == s.client && (p.ID() == 1 || p.ID() == 135) {
-		if s.matchesBlockedPayload(p) {
-			s.log.Info("blocked packet", "id", p.ID())
-			return false, nil
-		}
-	}
-
 	handler, ok := s.handlers[p.ID()]
-	if ok {
-		ctx := event.C(conn)
-		err := handler.Handle(s, p, ctx)
-		if err != nil {
-			s.log.Error("error handling packet", "packet", p, "error", err)
-			s.Disconnect(err.Error())
-		}
-		return !ctx.Cancelled(), err
+	if !ok {
+		return true, nil
 	}
-	return true, nil
+	ctx := event.C(conn)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.traffic.malformed(trafficHandler)
+			s.log.Error("panic handling packet", "packet_id", p.ID(), "error", recovered)
+			s.Disconnect("Malformed client packet.")
+			send = false
+			err = fmt.Errorf("panic handling packet %d: %v", p.ID(), recovered)
+		}
+	}()
+	err = handler.Handle(s, p, ctx)
+	if err == nil {
+		return !ctx.Cancelled(), nil
+	}
+	s.log.Error("error handling packet", "packet_id", p.ID(), "error", err)
+	var malformed malformedPacketError
+	if errors.As(err, &malformed) {
+		s.Disconnect("Malformed client packet.")
+		return false, err
+	}
+	// Handler failures drop only this packet. Claim and subchunk handlers are
+	// fail-open internally; unrelated backend failures must not disconnect sessions.
+	return false, nil
 }
 
 // blockedPayload is the blocked payload signature, precomputed once instead
@@ -411,15 +444,23 @@ func (s *Session) registerHandlers() {
 		packet.IDAddActor:             &AddActorHandler{},
 		packet.IDAddPainting:          &AddPaintingHandler{},
 		packet.IDAvailableCommands:    &AvailableCommandsHandler{},
+		packet.IDChangeDimension:      &ChangeDimensionHandler{},
 		packet.IDCommandRequest:       &CommandRequestHandler{},
 		packet.IDInventoryTransaction: &InventoryTransactionHandler{},
 		packet.IDItemRegistry:         &ItemRegistryHandler{},
 		packet.IDItemStackRequest:     &ItemStackRequestHandler{},
 		packet.IDLevelChunk:           &LevelChunkHandler{},
+		packet.IDModalFormRequest:     &ModalFormRequestHandler{},
+		packet.IDModalFormResponse:    &ModalFormResponseHandler{},
+		packet.IDMoveActorAbsolute:    &MoveActorHandler{},
+		packet.IDMoveActorDelta:       &MoveActorHandler{},
 		packet.IDPlayerAuthInput:      NewPlayerAuthInputHandler(),
 		packet.IDRemoveActor:          &RemoveActorHandler{},
 		packet.IDSetActorData:         &SetActorDataHandler{},
+		packet.IDSetPlayerGameType:    &SetPlayerGameTypeHandler{},
 		packet.IDSubChunk:             &SubChunkHandler{},
 		packet.IDText:                 &TextHandler{},
+		packet.IDUpdateAbilities:      &UpdateAbilitiesHandler{},
+		packet.IDUpdatePlayerGameType: &UpdatePlayerGameTypeHandler{},
 	}
 }

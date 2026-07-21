@@ -15,6 +15,7 @@ import (
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/login"
 	"github.com/sandertv/gophertunnel/minecraft/resource"
+	"github.com/smell-of-curry/gobds/gobds/claim"
 	"github.com/smell-of-curry/gobds/gobds/cmd"
 	"github.com/smell-of-curry/gobds/gobds/infra"
 	"github.com/smell-of-curry/gobds/gobds/session"
@@ -44,9 +45,11 @@ type UserConfig struct {
 		MinX, MinZ int32
 		MaxX, MaxZ int32
 	}
-	PingIndicator struct {
-		Enabled    bool
-		Identifier string
+	Claims struct {
+		PrefilterEnabled     bool
+		DenyRenderingEnabled bool
+		PollInterval         string
+		MaxSnapshotAge       string
 	}
 	AFKTimer struct {
 		Enabled         bool
@@ -80,6 +83,14 @@ type UserConfig struct {
 		Enabled bool
 		URL     string
 		Key     string
+		// WhitelistedCIDRs are IP ranges (e.g. "45.230.64.0/22") never
+		// treated as VPN/proxy connections. Used for residential ISP
+		// blocks the detection API misclassifies.
+		WhitelistedCIDRs []string
+	}
+	TrafficProtection session.TrafficConfig
+	DuplicateXUID     struct {
+		Enabled bool
 	}
 	Encryption struct {
 		Key string
@@ -191,14 +202,6 @@ func (c UserConfig) afkTimer() *infra.AFKTimer {
 	}
 }
 
-// pingIndicator returns new PingIndicator instance.
-func (c UserConfig) pingIndicator() *infra.PingIndicator {
-	if !c.PingIndicator.Enabled {
-		return nil
-	}
-	return &infra.PingIndicator{Identifier: c.PingIndicator.Identifier}
-}
-
 // whiteList returns new Whitelist instance.
 func (c UserConfig) whiteList(log *slog.Logger) *whitelist.Whitelist {
 	if !c.Network.Whitelisted {
@@ -264,7 +267,7 @@ func DefaultConfig() UserConfig {
 			LocalAddress:  "127.0.0.1:19132",
 			RemoteAddress: "127.0.0.1:19133",
 			MOTD:          "Some server",
-			MaxPlayers:    80,
+			MaxPlayers:    85,
 			ClaimService: struct {
 				Enabled bool
 				URL     string
@@ -285,9 +288,10 @@ func DefaultConfig() UserConfig {
 	c.Network.FlushRate = 20
 
 	c.Border.Enabled = false
-
-	c.PingIndicator.Enabled = true
-	c.PingIndicator.Identifier = "&_playerPing:"
+	c.Claims.PrefilterEnabled = false
+	c.Claims.DenyRenderingEnabled = false
+	c.Claims.PollInterval = claim.DefaultPollInterval.String()
+	c.Claims.MaxSnapshotAge = claim.DefaultMaxSnapshotAge.String()
 
 	c.AFKTimer.Enabled = true
 	c.AFKTimer.TimeoutDuration = "10m"
@@ -305,6 +309,11 @@ func DefaultConfig() UserConfig {
 
 	c.VPNService.Enabled = false
 	c.VPNService.URL = "http://ip-api.com/json"
+	// Megalink S.R.L. (Argentina) — residential ISP flagged as proxy by ip-api.
+	c.VPNService.WhitelistedCIDRs = []string{"45.230.64.0/22"}
+
+	c.TrafficProtection = session.DefaultTrafficConfig()
+	c.DuplicateXUID.Enabled = false
 
 	c.Encryption.Key = defaultKey
 	return c
